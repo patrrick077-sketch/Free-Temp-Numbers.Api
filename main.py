@@ -12,9 +12,10 @@ app = Flask(__name__)
 
 # ================= CONFIG =================
 LIST_URL = "https://temp-number.com/public/temporary-numbers?q=&country=United+States&per_page=10&new24=1"
-POLL_INTERVAL = 25
-MAX_POLL_DURATION = 3600
+POLL_INTERVAL = 25          # seconds between checks
+MAX_POLL_DURATION = 3600    # 60 minutes max
 
+# Create a single scraper instance to maintain cookies/session
 scraper = cloudscraper.create_scraper(
     browser={
         'browser': 'chrome',
@@ -23,19 +24,20 @@ scraper = cloudscraper.create_scraper(
     }
 )
 
+# Global dictionary to store latest messages for each monitored number
+# Structure: { "phone_number": [list_of_message_dicts] }
 latest_messages_cache = {}
+# Track the freshest message time seen so far for each number
+last_seen_state = {}
 
 # ================= HELPER FUNCTIONS =================
 
-def construct_detail_url(phone):
-    """Helper to build the URL internally when needed."""
-    return f"https://temp-number.com/public/temporary-numbers/United-States/{phone}/1"
-
 def get_numbers_list():
-    """Fetches list and hides the detail URL from output."""
+    """Fetches and parses the list of phone numbers."""
     try:
         resp = scraper.get(LIST_URL, timeout=15)
         if resp.status_code != 200:
+            print(f"List page failed: {resp.status_code}", flush=True)
             return []
     except Exception as e:
         print(f"Request error: {e}", flush=True)
@@ -51,7 +53,6 @@ def get_numbers_list():
         if not match:
             continue
 
-        # We still parse the URL to extract the phone number
         detail_url = match.group(1)
         if not detail_url.startswith("http"):
             detail_url = "https://temp-number.com" + detail_url
@@ -70,7 +71,7 @@ def get_numbers_list():
         numbers.append({
             "phone": phone_raw,
             "formatted": formatted,
-            # "detail_url": detail_url,  <-- REMOVED from JSON output
+            "detail_url": detail_url,
             "status": status
         })
 
@@ -78,6 +79,7 @@ def get_numbers_list():
 
 
 def parse_time_ago(time_str):
+    """Converts 'X minutes ago' string to seconds."""
     if not time_str:
         return 999999
     time_str = time_str.lower().strip()
@@ -92,11 +94,14 @@ def parse_time_ago(time_str):
 
 
 def get_new_messages(detail_url, last_seen_seconds_ago=999999):
+    """Fetches messages from a detail page and filters for new ones."""
     try:
         resp = scraper.get(detail_url, timeout=12)
         if resp.status_code != 200:
+            print(f"Detail page failed: {resp.status_code}", flush=True)
             return [], last_seen_seconds_ago
     except Exception as e:
+        print(f"Request error: {e}", flush=True)
         return [], last_seen_seconds_ago
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -117,6 +122,7 @@ def get_new_messages(detail_url, last_seen_seconds_ago=999999):
         if seconds_ago < freshest_this_poll:
             freshest_this_poll = seconds_ago
 
+        # Filter: only messages newer than what we've already seen
         if seconds_ago > last_seen_seconds_ago + 5:
             continue
 
@@ -148,23 +154,30 @@ def get_new_messages(detail_url, last_seen_seconds_ago=999999):
 # ================= MONITORING THREAD =================
 
 def monitor_thread_func(phone, detail_url):
+    """Background thread function to monitor a specific number."""
     print(f"[Thread] Starting monitor for {phone}...", flush=True)
+    
+    # Initialize state for this thread
     last_freshest = 999999
     first_poll = True
     start = time.time()
     
-    # Initialize empty list immediately
+    # Initialize cache for this number
     latest_messages_cache[phone] = []
 
     while time.time() - start < MAX_POLL_DURATION:
         try:
+            ts = datetime.now().strftime("%H:%M:%S")
+            # print(f"[{ts}] [{phone}] Checking...", flush=True) # Optional: Debug log
+
             new_msgs, new_freshest = get_new_messages(detail_url, last_freshest)
             last_freshest = min(last_freshest, new_freshest)
 
             if new_msgs:
-                # Prepend new messages
+                print(f"[{ts}] [{phone}] Found {len(new_msgs)} new message(s)", flush=True)
+                # Add new messages to the front of the list (newest first)
                 latest_messages_cache[phone] = new_msgs + latest_messages_cache[phone]
-                # Limit cache size
+                # Optional: Limit cache size to prevent memory issues
                 if len(latest_messages_cache[phone]) > 20:
                     latest_messages_cache[phone] = latest_messages_cache[phone][:20]
 
@@ -178,6 +191,7 @@ def monitor_thread_func(phone, detail_url):
             time.sleep(20)
 
     print(f"[Thread] Monitoring finished for {phone}.", flush=True)
+    # Clean up
     if phone in latest_messages_cache:
         del latest_messages_cache[phone]
 
@@ -189,51 +203,64 @@ def index():
     return jsonify({
         "status": "running",
         "endpoints": {
-            "/numbers": "Get list of available numbers (cleaned)",
-            "/messages/<phone>": "Get messages (auto-starts monitor if needed)"
+            "/numbers": "Get list of available numbers",
+            "/start/<phone>": "Start monitoring a specific phone number",
+            "/messages/<phone>": "Get cached messages for a monitored number"
         }
     })
 
 @app.route('/numbers')
 def api_numbers():
+    """Returns list of numbers."""
     data = get_numbers_list()
     return jsonify({
         "count": len(data),
         "numbers": data
     })
 
-@app.route('/messages/<phone>')
-def api_get_messages(phone):
-    # 1. Check if monitoring is already active
+@app.route('/start/<phone>')
+def api_start_monitor(phone):
+    """Starts monitoring a specific phone number in the background."""
+    
+    # 1. Verify the number exists and get its URL
+    # We fetch the list again to ensure we have the valid detail_url
+    numbers = get_numbers_list()
+    target = next((n for n in numbers if n['phone'] == phone), None)
+    
+    if not target:
+        return jsonify({"error": "Phone number not found in current list"}), 404
+
+    # 2. Check if already running (simple check)
     if phone in latest_messages_cache:
-        return jsonify({
-            "status": "monitoring_active",
-            "phone": phone,
-            "messages": latest_messages_cache[phone]
-        })
-    
-    # 2. If not active, start monitoring automatically
-    # We construct the URL internally so the user doesn't need to provide it
-    detail_url = construct_detail_url(phone)
-    
-    print(f"[API] Auto-starting monitor for {phone}...", flush=True)
-    
-    # Initialize cache key so subsequent requests know it's starting
-    latest_messages_cache[phone] = [] 
-    
-    t = threading.Thread(target=monitor_thread_func, args=(phone, detail_url))
-    t.daemon = True
+        return jsonify({"status": "already_running", "message": f"Already monitoring {phone}"})
+
+    # 3. Start Thread
+    t = threading.Thread(target=monitor_thread_func, args=(phone, target['detail_url']))
+    t.daemon = True # Allows flask to kill threads on exit
     t.start()
     
     return jsonify({
-        "status": "monitor_started",
-        "phone": phone,
-        "message": "Monitoring initiated. Please refresh in a few seconds to see initial messages.",
-        "messages": []
+        "status": "started", 
+        "phone": phone, 
+        "detail_url": target['detail_url']
     })
+
+@app.route('/messages/<phone>')
+def api_get_messages(phone):
+    """Returns cached messages for the phone number."""
+    if phone not in latest_messages_cache:
+        return jsonify({"error": "No active monitor for this number. Call /start/<phone> first."}), 404
+    
+    return jsonify({
+        "phone": phone,
+        "messages": latest_messages_cache[phone]
+    })
+
 
 # ================= MAIN =================
 
 if __name__ == '__main__':
     print("Starting Flask Server...", flush=True)
+    print("Access http://127.0.0.1:5000/numbers to see available numbers", flush=True)
+    # use_reloader=False is important to prevent the scraper from initializing twice
     app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
