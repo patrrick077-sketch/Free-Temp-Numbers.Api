@@ -7,7 +7,7 @@ from flask import Flask, jsonify
 app = Flask(__name__)
 
 # ================= CONFIG =================
-LIST_URL = "https://temp-number.com/public/temporary-numbers?q=&country=United+States&per_page=10&new24=1"
+LIST_URL = "https://temp-number.com/public/temporary-numbers?q=&country=United+States&per_page=20"
 
 scraper = cloudscraper.create_scraper(
     browser={
