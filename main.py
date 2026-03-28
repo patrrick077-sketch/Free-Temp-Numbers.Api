@@ -21,7 +21,7 @@ scraper = cloudscraper.create_scraper(
 
 def construct_detail_url(phone):
     """Constructs the URL internally based on the phone number."""
-    return f"https://temp-number.com/public/temporary-numbers/United-States/{phone}/1"
+    return f"https://temp-number.com/temporary-numbers/United-States/{phone}/1"
 
 def get_numbers_list():
     try:
